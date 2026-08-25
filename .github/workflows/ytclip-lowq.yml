@@ -1,0 +1,142 @@
+name: Temporary YouTube clip compact-source path
+
+on:
+  push:
+    branches:
+      - tmp-ytclip-lowq-20260825
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_URL: https://www.youtube.com/watch?v=YLkqO-RqyeA
+  OUTPUT_FILE: youtube-clip-53m44s-54m12s.mp4
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Try compact progressive renditions and cut interval
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE=/tmp/source.mp4
+          rm -f "$SOURCE" "$OUTPUT_FILE"
+
+          python <<'PY'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          endpoint = 'https://ahm7xmakki.com/api/alldl?url=' + urllib.parse.quote(os.environ['VIDEO_URL'], safe='')
+          req = urllib.request.Request(endpoint, headers={
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept': 'application/json',
+          })
+          with urllib.request.urlopen(req, timeout=180) as response:
+              payload = json.load(response)
+          if not payload.get('success'):
+              raise RuntimeError(payload)
+
+          info = payload.get('mediaInfo') or {}
+          candidates = []
+          for item in info.get('qualities') or []:
+              url = item.get('url')
+              if not url:
+                  continue
+              label = str(item.get('quality') or 'unknown')
+              m = re.search(r'(\d+)', label)
+              height = int(m.group(1)) if m else 0
+              candidates.append({'label': label, 'height': height, 'url': url})
+          if info.get('videoUrl'):
+              candidates.append({'label': 'primary', 'height': 0, 'url': info['videoUrl']})
+          if not candidates:
+              raise RuntimeError('No progressive source candidates')
+
+          # Compact versions first; among useful small renditions, prefer the highest.
+          candidates.sort(key=lambda x: (x['height'] == 0, x['height']))
+          print('Resolved title:', info.get('title') or '(untitled)')
+          print('Available labels:', ', '.join(x['label'] for x in candidates))
+          with open('/tmp/candidates.jsonl', 'w', encoding='utf-8') as f:
+              for item in candidates:
+                  f.write(json.dumps(item, ensure_ascii=False) + '\n')
+          PY
+
+          complete=0
+          total=$(wc -l < /tmp/candidates.jsonl)
+          for idx in $(seq 1 "$total"); do
+            python - "$idx" <<'PY'
+          import json
+          import sys
+          idx = int(sys.argv[1]) - 1
+          with open('/tmp/candidates.jsonl', encoding='utf-8') as f:
+              rows = [json.loads(line) for line in f]
+          item = rows[idx]
+          print(f"Trying compact candidate {idx + 1}/{len(rows)}: {item['label']}")
+          with open('/tmp/direct-url.txt', 'w', encoding='utf-8') as f:
+              f.write(item['url'])
+          PY
+
+            rm -f "$SOURCE"
+            set +e
+            curl --location --fail --show-error \
+              --connect-timeout 30 --max-time 600 \
+              -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
+              "$(cat /tmp/direct-url.txt)" -o "$SOURCE"
+            status=$?
+            set -e
+            bytes=$(stat -c%s "$SOURCE" 2>/dev/null || echo 0)
+            echo "curl status: $status; bytes: $bytes"
+
+            if [ "$status" -eq 0 ] && \
+               duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SOURCE" 2>/dev/null) && \
+               python - "$duration" <<'PY'
+          import sys
+          raise SystemExit(0 if float(sys.argv[1]) > 3252 else 1)
+          PY
+            then
+              complete=1
+              echo "Complete compact source duration: $duration seconds"
+              break
+            fi
+          done
+
+          if [ "$complete" -ne 1 ]; then
+            echo "No compact rendition completed" >&2
+            exit 1
+          fi
+
+          ffmpeg -hide_banner -y \
+            -ss 00:53:44 -i "$SOURCE" -t 28 \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v libx264 -preset fast -crf 18 \
+            -c:a aac -b:a 192k \
+            -movflags +faststart "$OUTPUT_FILE"
+
+          test -s "$OUTPUT_FILE"
+          duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE")
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 27.0 <= duration <= 29.0:
+              raise SystemExit(f'Unexpected output duration: {duration}')
+          print(f'Validated output duration: {duration:.3f}s')
+          PY
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,sample_rate,channels \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      - name: Upload clip
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-clip-53m44s-54m12s-compact
+          path: youtube-clip-53m44s-54m12s.mp4
+          if-no-files-found: error
+          retention-days: 1
