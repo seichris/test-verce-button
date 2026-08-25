@@ -1,0 +1,89 @@
+name: Temporary YouTube clip browser-token path
+
+on:
+  push:
+    branches:
+      - tmp-ytclip-pot-20260825
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_URL: https://www.youtube.com/watch?v=YLkqO-RqyeA
+  OUTPUT_FILE: youtube-clip-53m44s-54m12s.mp4
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install downloader, browser token provider, and media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+          python -m pip install --upgrade yt-dlp yt-dlp-getpot-wpc
+          google-chrome --version
+          yt-dlp --version
+
+      - name: Mint proof token and extract requested interval
+        shell: bash
+        run: |
+          set -o pipefail
+          rm -f "$OUTPUT_FILE"
+
+          try_download() {
+            local clients="$1"
+            echo "Trying YouTube clients: $clients"
+            rm -f "$OUTPUT_FILE" *.part *.ytdl
+            xvfb-run -a yt-dlp -v \
+              --no-playlist \
+              --remote-components ejs:github \
+              --js-runtimes node \
+              --extractor-args "youtube:player_client=$clients" \
+              --extractor-args "youtubepot-wpc:browser_path=/usr/bin/google-chrome" \
+              --download-sections '*00:53:44-00:54:12' \
+              --force-keyframes-at-cuts \
+              -f 'bv*[height<=1080]+ba/b[height<=1080]/b' \
+              --merge-output-format mp4 \
+              --recode-video mp4 \
+              -o "$OUTPUT_FILE" \
+              "$VIDEO_URL"
+          }
+
+          success=0
+          for clients in \
+            'mweb,web_embedded,web_safari' \
+            'web_embedded,mweb' \
+            'android_vr,web_embedded' \
+            'tv,web_embedded'; do
+            if timeout 600 bash -c "$(declare -f try_download); try_download '$clients'"; then
+              if [ -s "$OUTPUT_FILE" ]; then
+                success=1
+                break
+              fi
+            fi
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "Browser-token extraction did not produce a file" >&2
+            exit 1
+          fi
+
+          duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE")
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 27.0 <= duration <= 29.5:
+              raise SystemExit(f'Unexpected output duration: {duration}')
+          print(f'Validated output duration: {duration:.3f}s')
+          PY
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,sample_rate,channels \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      - name: Upload clip
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-clip-53m44s-54m12s-pot
+          path: youtube-clip-53m44s-54m12s.mp4
+          if-no-files-found: error
+          retention-days: 1
