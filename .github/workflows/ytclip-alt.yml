@@ -1,0 +1,193 @@
+name: Temporary YouTube clip alternate path
+
+on:
+  push:
+    branches:
+      - tmp-ytclip-alt-20260825
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_ID: YLkqO-RqyeA
+  VIDEO_URL: https://www.youtube.com/watch?v=YLkqO-RqyeA
+  OUTPUT_FILE: youtube-clip-53m44s-54m12s.mp4
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Resolve proxy streams and cut interval
+        shell: bash
+        run: |
+          set -u
+
+          valid_output() {
+            [ -s "$OUTPUT_FILE" ] || return 1
+            duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null) || return 1
+            python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          raise SystemExit(0 if 27.0 <= duration <= 29.0 else 1)
+          PY
+          }
+
+          try_progressive() {
+            local url="$1"
+            rm -f "$OUTPUT_FILE"
+            timeout 240 ffmpeg -hide_banner -loglevel warning -y \
+              -rw_timeout 90000000 \
+              -ss 00:53:44 -i "$url" -t 28 \
+              -map 0:v:0 -map 0:a:0? \
+              -c:v libx264 -preset fast -crf 18 \
+              -c:a aac -b:a 192k \
+              -movflags +faststart "$OUTPUT_FILE" >/tmp/ffmpeg.log 2>&1
+            valid_output
+          }
+
+          try_separate() {
+            local video_url="$1"
+            local audio_url="$2"
+            rm -f "$OUTPUT_FILE"
+            timeout 240 ffmpeg -hide_banner -loglevel warning -y \
+              -rw_timeout 90000000 \
+              -ss 00:53:44 -i "$video_url" \
+              -ss 00:53:44 -i "$audio_url" -t 28 \
+              -map 0:v:0 -map 1:a:0 \
+              -c:v libx264 -preset fast -crf 18 \
+              -c:a aac -b:a 192k \
+              -movflags +faststart "$OUTPUT_FILE" >/tmp/ffmpeg.log 2>&1
+            valid_output
+          }
+
+          success=0
+          piped_apis=(
+            https://pipedapi.kavin.rocks
+            https://pipedapi.leptons.xyz
+            https://pipedapi.nosebs.ru
+            https://pipedapi-libre.kavin.rocks
+            https://piped-api.privacy.com.de
+            https://pipedapi.adminforge.de
+            https://api.piped.yt
+            https://pipedapi.drgns.space
+            https://pipedapi.owo.si
+            https://pipedapi.ducks.party
+            https://piped-api.codespace.cz
+            https://pipedapi.reallyaweso.me
+            https://api.piped.private.coffee
+            https://pipedapi.darkness.services
+            https://pipedapi.orangenet.cc
+          )
+
+          for api in "${piped_apis[@]}"; do
+            echo "Trying Piped API: $api"
+            rm -f /tmp/streams.json /tmp/mode /tmp/video-url /tmp/audio-url
+            curl -fsSL --connect-timeout 10 --max-time 75 \
+              -A 'Mozilla/5.0' "$api/streams/$VIDEO_ID" -o /tmp/streams.json || continue
+
+            python <<'PY' || continue
+          import json
+
+          with open('/tmp/streams.json', encoding='utf-8') as f:
+              data = json.load(f)
+          videos = [v for v in data.get('videoStreams', []) if v.get('url')]
+          audios = [a for a in data.get('audioStreams', []) if a.get('url')]
+
+          def is_mp4(item):
+              text = (str(item.get('mimeType', '')) + ' ' + str(item.get('format', '')) + ' ' + str(item.get('codec', ''))).lower()
+              return 'mp4' in text or 'mpeg_4' in text or 'avc1' in text
+
+          progressive = [v for v in videos if not v.get('videoOnly', False)]
+          progressive.sort(key=lambda v: (is_mp4(v), min(int(v.get('height') or 0), 1080), int(v.get('bitrate') or 0)), reverse=True)
+          if progressive:
+              with open('/tmp/mode', 'w') as f: f.write('progressive')
+              with open('/tmp/video-url', 'w') as f: f.write(progressive[0]['url'])
+              print('Selected progressive stream:', progressive[0].get('quality'), progressive[0].get('format'))
+              raise SystemExit(0)
+
+          videos.sort(key=lambda v: (is_mp4(v), min(int(v.get('height') or 0), 1080), int(v.get('bitrate') or 0)), reverse=True)
+          audios.sort(key=lambda a: (('mp4' in str(a.get('mimeType', '')).lower() or 'm4a' in str(a.get('format', '')).lower()), int(a.get('bitrate') or 0)), reverse=True)
+          if not videos or not audios:
+              raise SystemExit(1)
+          with open('/tmp/mode', 'w') as f: f.write('separate')
+          with open('/tmp/video-url', 'w') as f: f.write(videos[0]['url'])
+          with open('/tmp/audio-url', 'w') as f: f.write(audios[0]['url'])
+          print('Selected separate streams:', videos[0].get('quality'), audios[0].get('quality'))
+          PY
+
+            if [ "$(cat /tmp/mode)" = progressive ]; then
+              try_progressive "$(cat /tmp/video-url)" && success=1
+            else
+              try_separate "$(cat /tmp/video-url)" "$(cat /tmp/audio-url)" && success=1
+            fi
+            [ "$success" -eq 1 ] && break
+            tail -20 /tmp/ffmpeg.log || true
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "Piped paths failed; trying official-listed Invidious proxies"
+            invidious=(
+              https://inv.nadeko.net
+              https://invidious.nerdvpn.de
+              https://yt.chocolatemoo53.com
+              https://invidious.tiekoetter.com
+              https://invidious.f5.si
+            )
+            for base in "${invidious[@]}"; do
+              echo "Trying Invidious: $base"
+              stream="$base/latest_version?id=$VIDEO_ID&itag=18&local=true"
+              try_progressive "$stream" && success=1
+              [ "$success" -eq 1 ] && break
+              tail -20 /tmp/ffmpeg.log || true
+            done
+          fi
+
+          if [ "$success" -ne 1 ]; then
+            echo "Frontend proxies failed; trying public YT Downloader service"
+            rm -f /tmp/ytdl-info.json /tmp/ytdl-url
+            encoded=$(python -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["VIDEO_URL"], safe=""))')
+            curl -fsSL --connect-timeout 15 --max-time 180 \
+              "https://ytdl.fahrigunadi.dev/api/info?url=$encoded" -o /tmp/ytdl-info.json || true
+            python <<'PY' || true
+          import json
+          try:
+              with open('/tmp/ytdl-info.json', encoding='utf-8') as f:
+                  data = json.load(f)
+          except Exception:
+              raise SystemExit(1)
+          formats = [x for x in data.get('formats', []) if not x.get('is_audio_only') and not x.get('needs_audio_merge') and x.get('download_url')]
+          formats.sort(key=lambda x: (x.get('ext') == 'mp4', int(''.join(c for c in str(x.get('resolution', '0')) if c.isdigit()) or 0)), reverse=True)
+          if not formats:
+              raise SystemExit(1)
+          with open('/tmp/ytdl-url', 'w') as f:
+              f.write('https://ytdl.fahrigunadi.dev' + formats[0]['download_url'])
+          print('Selected YT Downloader format:', formats[0].get('format_id'), formats[0].get('resolution'))
+          PY
+            if [ -s /tmp/ytdl-url ]; then
+              try_progressive "$(cat /tmp/ytdl-url)" && success=1
+            fi
+          fi
+
+          if [ "$success" -ne 1 ]; then
+            echo "All alternate proxy paths failed" >&2
+            exit 1
+          fi
+
+          duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE")
+          echo "Validated duration: $duration seconds"
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,sample_rate,channels \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      - name: Upload clip
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-clip-53m44s-54m12s-alt
+          path: youtube-clip-53m44s-54m12s.mp4
+          if-no-files-found: error
+          retention-days: 1
