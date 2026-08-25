@@ -1,0 +1,99 @@
+name: Temporary YouTube clip
+
+on:
+  push:
+    branches:
+      - tmp-ytclip-ylkqo-20260825
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_URL: https://www.youtube.com/watch?v=YLkqO-RqyeA
+  OUTPUT_FILE: youtube-clip-53m44s-54m12s.mp4
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade yt-dlp
+
+      - name: Extract requested section
+        shell: bash
+        run: |
+          set -o pipefail
+          rm -f "$OUTPUT_FILE"
+
+          # First attempt: let yt-dlp request only the required interval.
+          yt-dlp \
+            --download-sections '*00:53:44-00:54:12' \
+            --force-keyframes-at-cuts \
+            --remote-components ejs:github \
+            --js-runtimes node \
+            -f 'bv*[height<=1080]+ba/b[height<=1080]/b' \
+            --merge-output-format mp4 \
+            --recode-video mp4 \
+            -o "$OUTPUT_FILE" \
+            "$VIDEO_URL" || true
+
+          # Fallback: resolve a merged MP4 through a public downloader API,
+          # fetch the source, and cut locally with ffmpeg.
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            python <<'PY'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          video_url = os.environ['VIDEO_URL']
+          endpoint = 'https://ahm7xmakki.com/api/alldl?url=' + urllib.parse.quote(video_url, safe='')
+          req = urllib.request.Request(endpoint, headers={'User-Agent': 'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=180) as response:
+              payload = json.load(response)
+          if not payload.get('success'):
+              raise RuntimeError(payload)
+          info = payload.get('mediaInfo') or {}
+          candidates = []
+          for item in info.get('qualities') or []:
+              url = item.get('url')
+              if not url:
+                  continue
+              quality = str(item.get('quality') or '')
+              match = re.search(r'(\d+)', quality)
+              height = int(match.group(1)) if match else 0
+              candidates.append((height, url))
+          direct = max(candidates, default=(0, info.get('videoUrl')))[1]
+          if not direct:
+              raise RuntimeError('Downloader API returned no video URL')
+          with open('/tmp/direct-url.txt', 'w') as f:
+              f.write(direct)
+          PY
+            curl --fail --location --retry 3 --retry-all-errors \
+              -A 'Mozilla/5.0' "$(cat /tmp/direct-url.txt)" -o /tmp/source-video
+            ffmpeg -hide_banner -y \
+              -ss 00:53:44 -i /tmp/source-video -t 28 \
+              -map 0:v:0 -map 0:a:0? \
+              -c:v libx264 -preset medium -crf 18 \
+              -c:a aac -b:a 192k \
+              -movflags +faststart "$OUTPUT_FILE"
+          fi
+
+          test -s "$OUTPUT_FILE"
+          ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE"
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      - name: Upload clip
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-clip-53m44s-54m12s
+          path: youtube-clip-53m44s-54m12s.mp4
+          if-no-files-found: error
+          retention-days: 1
