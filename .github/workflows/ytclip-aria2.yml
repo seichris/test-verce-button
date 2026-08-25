@@ -1,0 +1,159 @@
+name: Temporary YouTube clip segmented path
+
+on:
+  push:
+    branches:
+      - tmp-ytclip-aria2-20260825
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_URL: https://www.youtube.com/watch?v=YLkqO-RqyeA
+  OUTPUT_FILE: youtube-clip-53m44s-54m12s.mp4
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2
+
+      - name: Fetch source in parallel byte ranges and cut
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE=/tmp/source.mp4
+          rm -f "$SOURCE" "$SOURCE.aria2" "$OUTPUT_FILE"
+
+          resolve_candidate() {
+            local rank="$1"
+            RANK="$rank" python <<'PY'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          endpoint = 'https://ahm7xmakki.com/api/alldl?url=' + urllib.parse.quote(os.environ['VIDEO_URL'], safe='')
+          req = urllib.request.Request(endpoint, headers={
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept': 'application/json',
+          })
+          with urllib.request.urlopen(req, timeout=180) as response:
+              payload = json.load(response)
+          if not payload.get('success'):
+              raise RuntimeError(payload)
+
+          info = payload.get('mediaInfo') or {}
+          candidates = []
+          for item in info.get('qualities') or []:
+              url = item.get('url')
+              if not url:
+                  continue
+              label = str(item.get('quality') or 'unknown')
+              m = re.search(r'(\d+)', label)
+              height = int(m.group(1)) if m else 0
+              candidates.append({'height': height, 'label': label, 'url': url})
+          if info.get('videoUrl'):
+              candidates.append({'height': 0, 'label': 'primary', 'url': info['videoUrl']})
+          if not candidates:
+              raise RuntimeError('No downloadable video candidates')
+
+          # Prefer the best conventional resolution first, then progressively smaller files.
+          candidates.sort(key=lambda x: (x['height'] <= 1080, x['height']), reverse=True)
+          dedup = []
+          seen = set()
+          for item in candidates:
+              key = (item['label'], item['url'])
+              if key not in seen:
+                  seen.add(key)
+                  dedup.append(item)
+          rank = int(os.environ['RANK'])
+          if rank >= len(dedup):
+              raise SystemExit(3)
+          selected = dedup[rank]
+          print(f"Resolved title: {info.get('title') or '(untitled)'}")
+          print(f"Candidate {rank + 1}/{len(dedup)}: {selected['label']}")
+          with open('/tmp/direct-url.txt', 'w', encoding='utf-8') as f:
+              f.write(selected['url'])
+          PY
+          }
+
+          complete=0
+          for rank in 0 1 2 3 4 5 6 7; do
+            rm -f "$SOURCE" "$SOURCE.aria2"
+            if ! resolve_candidate "$rank"; then
+              continue
+            fi
+
+            for refresh in 1 2 3; do
+              echo "Segmented transfer cycle $refresh for candidate $rank"
+              set +e
+              aria2c \
+                --dir=/tmp --out=source.mp4 \
+                --allow-overwrite=true --auto-file-renaming=false \
+                --file-allocation=none --continue=true \
+                --max-concurrent-downloads=1 \
+                --max-connection-per-server=16 --split=16 --min-split-size=1M \
+                --max-tries=20 --retry-wait=1 \
+                --connect-timeout=30 --timeout=45 \
+                --lowest-speed-limit=1K \
+                --user-agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
+                "$(cat /tmp/direct-url.txt)"
+              aria_status=$?
+              set -e
+              bytes=$(stat -c%s "$SOURCE" 2>/dev/null || echo 0)
+              echo "aria2 status: $aria_status; downloaded bytes: $bytes"
+
+              if [ "$aria_status" -eq 0 ] && \
+                 duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SOURCE" 2>/dev/null) && \
+                 python - "$duration" <<'PY'
+          import sys
+          raise SystemExit(0 if float(sys.argv[1]) > 3252 else 1)
+          PY
+              then
+                complete=1
+                echo "Complete source duration: $duration seconds"
+                break 2
+              fi
+
+              # Refresh the signed media URL and continue the same aria2 control file.
+              resolve_candidate "$rank" || true
+            done
+          done
+
+          if [ "$complete" -ne 1 ]; then
+            echo "No candidate completed successfully" >&2
+            exit 1
+          fi
+
+          ffmpeg -hide_banner -y \
+            -ss 00:53:44 -i "$SOURCE" -t 28 \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v libx264 -preset fast -crf 18 \
+            -c:a aac -b:a 192k \
+            -movflags +faststart "$OUTPUT_FILE"
+
+          test -s "$OUTPUT_FILE"
+          duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE")
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 27.0 <= duration <= 29.0:
+              raise SystemExit(f'Unexpected output duration: {duration}')
+          print(f'Validated output duration: {duration:.3f}s')
+          PY
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,sample_rate,channels \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      - name: Upload clip
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-clip-53m44s-54m12s-aria2
+          path: youtube-clip-53m44s-54m12s.mp4
+          if-no-files-found: error
+          retention-days: 1
